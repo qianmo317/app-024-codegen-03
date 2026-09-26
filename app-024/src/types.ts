@@ -43,6 +43,25 @@ export type EventInfo = {
   riddleIds: string[];
 };
 
+/** 领奖核销记录：同一兑奖号码只能存在一条（唯一约束在存储层保证） */
+export type PrizeClaim = {
+  id: string;
+  code: string;        // 兑奖号码 DJ-xxxx
+  recordId: string;    // 对应现场登记记录
+  riddleId: string;
+  at: number;          // 领取时间
+  window: string;      // 领取窗口
+  operator: string;    // 经手人
+};
+
+/** 某奖项一箱的设定数量：发到该数量时需先确认再继续发（0 = 不限） */
+export type PrizeStock = { prize: string; total: number };
+
+export type RedeemSettings = {
+  windows: string[];      // 领取窗口预设
+  stock: PrizeStock[];    // 分奖项设定数量
+};
+
 export type PrintSetup = {
   cardWmm: number;
   cardHmm: number;
@@ -56,6 +75,7 @@ export type AppSettings = {
   event: EventInfo;
   print: PrintSetup;
   prizes: string[];
+  redeem: RedeemSettings;
 };
 
 export const CATEGORY_LABEL: Record<RiddleCategory, string> = {

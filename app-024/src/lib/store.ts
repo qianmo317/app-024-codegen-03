@@ -1,5 +1,5 @@
 // 集中式应用状态：数据读写全部在此，UI 只做展示与动作调用
-import type { AppSettings, OnsiteRecord, Riddle } from '../types';
+import type { AppSettings, OnsiteRecord, PrizeClaim, Riddle } from '../types';
 import { validateRiddle } from './validate';
 import { EMPTY_CTX, loadDataCtx, type DataCtx } from './datafiles';
 import * as idb from './idb';
@@ -15,12 +15,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
     hostLine: '',
   },
   prizes: ['参与奖', '三等奖', '二等奖', '一等奖'],
+  redeem: { windows: ['1号窗口', '2号窗口'], stock: [] },
 };
 
 export interface AppState {
   ready: boolean;
   riddles: Riddle[];
   records: OnsiteRecord[];
+  claims: PrizeClaim[];
   settings: AppSettings;
   ctx: DataCtx; // 拼音/部件离线数据
   selected: Set<string>; // 批量出条选中（会话级，不持久化）
@@ -32,17 +34,30 @@ function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+// 跨标签页同步：一个窗口核销/撤销后，其余窗口立即刷新（双窗口发奖场景）
+const CLAIMS_CHANNEL = 'app-024-redeem';
+type ClaimsMsg = { type: 'claims-changed' };
+
+function openChannel(onMsg: (m: ClaimsMsg) => void): BroadcastChannel | null {
+  if (typeof BroadcastChannel === 'undefined') return null;
+  const ch = new BroadcastChannel(CLAIMS_CHANNEL);
+  ch.onmessage = (e) => onMsg(e.data as ClaimsMsg);
+  return ch;
+}
+
 class AppStore {
   private state: AppState = {
     ready: false,
     riddles: [],
     records: [],
+    claims: [],
     settings: DEFAULT_SETTINGS,
     ctx: EMPTY_CTX,
     selected: new Set<string>(),
   };
   private listeners = new Set<Listener>();
   private initPromise: Promise<void> | null = null;
+  private channel: BroadcastChannel | null = null;
 
   getState = (): AppState => this.state;
 
@@ -59,19 +74,25 @@ class AppStore {
   init(): Promise<void> {
     if (!this.initPromise) {
       this.initPromise = (async () => {
-        const [riddles, records, settings, ctx] = await Promise.all([
+        const [riddles, records, claims, settings, ctx] = await Promise.all([
           idb.getAll<Riddle>(idb.STORE_RIDDLES),
           idb.getAll<OnsiteRecord>(idb.STORE_RECORDS),
+          idb.getAll<PrizeClaim>(idb.STORE_CLAIMS),
           idb.getKV<AppSettings>(KV_SETTINGS),
           loadDataCtx(import.meta.env.BASE_URL),
         ]);
         this.state.riddles = riddles.sort((a, b) => a.no - b.no);
         this.state.records = records.sort((a, b) => b.at - a.at);
+        this.state.claims = claims.sort((a, b) => b.at - a.at);
         if (settings) {
           this.state.settings = {
             event: { ...DEFAULT_SETTINGS.event, ...settings.event },
             print: { ...DEFAULT_SETTINGS.print, ...settings.print },
             prizes: settings.prizes?.length ? settings.prizes : DEFAULT_SETTINGS.prizes,
+            redeem: {
+              windows: settings.redeem?.windows?.length ? settings.redeem.windows : DEFAULT_SETTINGS.redeem.windows,
+              stock: settings.redeem?.stock ?? [],
+            },
           };
         }
         if (!this.state.settings.print.hostLine && this.state.settings.event.host) {
@@ -79,10 +100,24 @@ class AppStore {
         }
         this.state.ctx = ctx;
         this.state.ready = true;
+        // 其他窗口核销变动时，从存储层重新加载核销记录
+        this.channel = openChannel((m) => {
+          if (m?.type === 'claims-changed') void this.reloadClaims();
+        });
         this.emit();
       })();
     }
     return this.initPromise;
+  }
+
+  private broadcastClaims(): void {
+    try { this.channel?.postMessage({ type: 'claims-changed' } satisfies ClaimsMsg); } catch { /* 忽略 */ }
+  }
+
+  private async reloadClaims(): Promise<void> {
+    const claims = await idb.getAll<PrizeClaim>(idb.STORE_CLAIMS);
+    this.state.claims = claims.sort((a, b) => b.at - a.at);
+    this.emit();
   }
 
   // ---- 谜库 ----
@@ -201,19 +236,31 @@ class AppStore {
 
   async removeRecord(id: string): Promise<void> {
     this.state.records = this.state.records.filter((r) => r.id !== id);
+    // 级联删除该登记的核销记录（若有）
+    const linked = this.state.claims.filter((c) => c.recordId === id);
+    this.state.claims = this.state.claims.filter((c) => c.recordId !== id);
     await idb.del(idb.STORE_RECORDS, id);
+    await Promise.all(linked.map((c) => idb.del(idb.STORE_CLAIMS, c.id)));
+    if (linked.length) this.broadcastClaims();
     this.emit();
   }
 
   async clearRecords(): Promise<void> {
     this.state.records = [];
+    this.state.claims = [];
     await idb.clearStore(idb.STORE_RECORDS);
+    await idb.clearStore(idb.STORE_CLAIMS);
+    this.broadcastClaims();
     this.emit();
   }
 
-  /** 兑奖号码生成：按登记时间顺序生成 DJ-xxxx（仅生成号码，不做在线抽奖） */
+  /** 兑奖号码生成：按登记时间顺序补齐 DJ-xxxx（从已有最大编号续号，保证全库唯一） */
   async generatePrizeCodes(): Promise<number> {
-    let n = 0;
+    let n = this.state.records.reduce((m, r) => {
+      const match = r.code?.match(/^DJ-(\d+)$/);
+      return match ? Math.max(m, parseInt(match[1], 10)) : m;
+    }, 0);
+    const start = n;
     const sorted = [...this.state.records].sort((a, b) => a.at - b.at);
     for (const r of sorted) {
       if (!r.code) {
@@ -222,8 +269,45 @@ class AppStore {
         await idb.put(idb.STORE_RECORDS, r);
       }
     }
-    if (n) this.emit();
-    return n;
+    if (n > start) this.emit();
+    return n - start;
+  }
+
+  // ---- 领奖核销 ----
+  claimByCode(code: string): PrizeClaim | undefined {
+    return this.state.claims.find((c) => c.code === code);
+  }
+
+  /**
+   * 核销发奖：存储层原子「查重+写入」，两个窗口同时提交也只会有一个成功；
+   * 重复核销返回首次领取记录（ok: false）。
+   */
+  async claimPrize(input: { code: string; recordId: string; riddleId: string; window: string; operator: string }): Promise<
+    { ok: true; claim: PrizeClaim } | { ok: false; existing: PrizeClaim | null }
+  > {
+    const claim: PrizeClaim = { ...input, id: uid(), at: Date.now() };
+    const res = await idb.claimOnce(claim);
+    if (res.ok) {
+      this.state.claims = [claim, ...this.state.claims];
+      this.broadcastClaims();
+      this.emit();
+      return { ok: true, claim };
+    }
+    // 已被核销（可能发生在其他窗口）：把首次核销记录并入本地状态
+    const existing = (res.existing as PrizeClaim | null) ?? this.claimByCode(input.code) ?? null;
+    if (existing && !this.state.claims.some((c) => c.code === existing.code)) {
+      this.state.claims = [existing, ...this.state.claims];
+    }
+    this.emit();
+    return { ok: false, existing };
+  }
+
+  /** 撤销核销（误操作纠正，需页面二次确认） */
+  async revokeClaim(id: string): Promise<void> {
+    this.state.claims = this.state.claims.filter((c) => c.id !== id);
+    await idb.del(idb.STORE_CLAIMS, id);
+    this.broadcastClaims();
+    this.emit();
   }
 
   // ---- 设置 ----
@@ -232,19 +316,26 @@ class AppStore {
       event: { ...this.state.settings.event, ...patch.event },
       print: { ...this.state.settings.print, ...patch.print },
       prizes: patch.prizes ?? this.state.settings.prizes,
+      redeem: patch.redeem
+        ? {
+            windows: patch.redeem.windows ?? this.state.settings.redeem.windows,
+            stock: patch.redeem.stock ?? this.state.settings.redeem.stock,
+          }
+        : this.state.settings.redeem,
     };
     await idb.setKV(KV_SETTINGS, this.state.settings);
     this.emit();
   }
 
   // ---- 统计 ----
-  stats(): { total: number; solved: number; remaining: number; prizes: number } {
+  stats(): { total: number; solved: number; remaining: number; prizes: number; claimed: number } {
     const solvedSet = new Set(this.state.records.map((r) => r.riddleId));
     return {
       total: this.state.riddles.length,
       solved: solvedSet.size,
       remaining: this.state.riddles.length - solvedSet.size,
       prizes: this.state.records.filter((r) => r.prize.trim()).length,
+      claimed: this.state.claims.length,
     };
   }
 

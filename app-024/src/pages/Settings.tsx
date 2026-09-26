@@ -1,4 +1,4 @@
-// 设置：活动信息 / 打印默认 / 奖品预设 / 导入导出 / 清空
+// 设置：活动信息 / 打印默认 / 奖品预设 / 领奖核销 / 导入导出 / 清空
 import { useState } from 'react';
 import { useAppState } from '../ui/router';
 import { riddleToRow, stringifyCSV, withBOM, RIDDLE_CSV_HEADERS } from '../lib/csv';
@@ -7,10 +7,11 @@ import { exportFileName, store } from '../lib/store';
 
 export function Settings() {
   const state = useAppState();
-  const { event, print, prizes } = state.settings;
+  const { event, print, prizes, redeem } = state.settings;
   const [ev, setEv] = useState(event);
   const [pr, setPr] = useState(print);
   const [newPrize, setNewPrize] = useState('');
+  const [newWindow, setNewWindow] = useState('');
   const [notice, setNotice] = useState('');
 
   const saveEvent = () => void store.saveSettings({ event: { ...ev, riddleIds: event.riddleIds } }).then(() => setNotice('活动信息已保存'));
@@ -22,7 +23,26 @@ export function Settings() {
     void store.saveSettings({ prizes: [...prizes, p] });
     setNewPrize('');
   };
-  const delPrize = (p: string) => void store.saveSettings({ prizes: prizes.filter((x) => x !== p) });
+  const delPrize = (p: string) => void store.saveSettings({
+    prizes: prizes.filter((x) => x !== p),
+    redeem: { ...redeem, stock: redeem.stock.filter((s) => s.prize !== p) }, // 同步清掉该奖项的设定数量
+  });
+
+  const addWindow = () => {
+    const w = newWindow.trim();
+    if (!w || redeem.windows.includes(w)) return;
+    void store.saveSettings({ redeem: { ...redeem, windows: [...redeem.windows, w] } });
+    setNewWindow('');
+  };
+  const delWindow = (w: string) => {
+    if (redeem.windows.length <= 1) { setNotice('至少保留一个领取窗口'); return; }
+    void store.saveSettings({ redeem: { ...redeem, windows: redeem.windows.filter((x) => x !== w) } });
+  };
+  const setStock = (prize: string, total: number) => {
+    const rest = redeem.stock.filter((s) => s.prize !== prize);
+    const stock = total > 0 ? [...rest, { prize, total }] : rest;
+    void store.saveSettings({ redeem: { ...redeem, stock } });
+  };
 
   const exportRiddles = () => {
     const csv = stringifyCSV([RIDDLE_CSV_HEADERS, ...state.riddles.map(riddleToRow)]);
@@ -40,9 +60,9 @@ export function Settings() {
   };
 
   const clearRecords = async () => {
-    if (!confirm(`确定清空全部 ${state.records.length} 条登记记录？此操作不可恢复。`)) return;
+    if (!confirm(`确定清空全部 ${state.records.length} 条登记记录（含 ${state.claims.length} 条核销记录）？此操作不可恢复。`)) return;
     await store.clearRecords();
-    setNotice('现场登记已清空');
+    setNotice('现场登记与核销记录已清空');
   };
   const clearRiddles = async () => {
     if (!confirm(`确定清空谜库全部 ${state.riddles.length} 条谜？此操作不可恢复。`)) return;
@@ -105,6 +125,37 @@ export function Settings() {
               <li key={p}><span className="badge">{p}</span><button className="btn btn-ghost btn-sm" onClick={() => delPrize(p)}>移除</button></li>
             ))}
             {!prizes.length && <li className="muted">暂无奖项（现场登记时奖项下拉为空）</li>}
+          </ul>
+        </div>
+
+        <div className="panel">
+          <h3>领奖核销</h3>
+          <h4>领取窗口</h4>
+          <div className="btn-row">
+            <input className="input" value={newWindow} onChange={(e) => setNewWindow(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') addWindow(); }} placeholder="新增窗口名，如 3号窗口" />
+            <button className="btn" onClick={addWindow}>添加</button>
+          </div>
+          <ul className="prize-list">
+            {redeem.windows.map((w) => (
+              <li key={w}><span className="badge">{w}</span><button className="btn btn-ghost btn-sm" onClick={() => delWindow(w)}>移除</button></li>
+            ))}
+          </ul>
+          <h4>奖项设定数量（一箱）</h4>
+          <p className="muted small">某奖项发到设定数量时，核销页会先要求确认再继续发；0 表示不限制。</p>
+          <ul className="prize-list stock-list">
+            {prizes.map((p) => (
+              <li key={p}>
+                <span className="badge">{p}</span>
+                <input
+                  className="input stock-input" type="number" min={0} step={1}
+                  value={redeem.stock.find((s) => s.prize === p)?.total ?? 0}
+                  onChange={(e) => setStock(p, Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+                />
+                <span className="muted small">份</span>
+              </li>
+            ))}
+            {!prizes.length && <li className="muted">请先在上方「奖品预设」添加奖项</li>}
           </ul>
         </div>
 

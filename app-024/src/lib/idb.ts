@@ -1,8 +1,9 @@
 // IndexedDB 轻封装（离线优先；无 IndexedDB 环境自动降级为内存存储）
 const DB_NAME = 'app-024-lantern-riddle';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 export const STORE_RIDDLES = 'riddles';
 export const STORE_RECORDS = 'records';
+export const STORE_CLAIMS = 'claims';
 export const STORE_KV = 'kv';
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
@@ -21,6 +22,11 @@ function openDB(): Promise<IDBDatabase | null> {
       if (!db.objectStoreNames.contains(STORE_RECORDS)) {
         const s = db.createObjectStore(STORE_RECORDS, { keyPath: 'id' });
         s.createIndex('riddleId', 'riddleId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_CLAIMS)) {
+        const s = db.createObjectStore(STORE_CLAIMS, { keyPath: 'id' });
+        // 兑奖号码唯一：同一号码全库只能核销一次（唯一索引兜底并发写入）
+        s.createIndex('code', 'code', { unique: true });
       }
       if (!db.objectStoreNames.contains(STORE_KV)) db.createObjectStore(STORE_KV, { keyPath: 'key' });
     };
@@ -101,4 +107,51 @@ export async function getKV<T>(key: string): Promise<T | null> {
 
 export async function setKV<T>(key: string, value: T): Promise<void> {
   await put(STORE_KV, { key, value });
+}
+
+export type ClaimOutcome =
+  | { ok: true }
+  | { ok: false; existing: { code: string } & Record<string, unknown> | null };
+
+/**
+ * 原子核销：同一兑奖号码全库只能成功写入一次。
+ * 查重与写入放在同一个 readwrite 事务里——同一 objectStore 上的读写事务
+ * 会被 IndexedDB 串行化，因此两个窗口（标签页）同时提交也只会有一个成功，
+ * 另一个拿到已存在的首次核销记录；code 唯一索引作为最后兜底。
+ */
+export async function claimOnce<T extends { id: string; code: string }>(claim: T): Promise<ClaimOutcome> {
+  const db = await openDB();
+  if (!db) {
+    // 内存降级：单线程内同步 check-and-set 天然原子
+    const m = memStore(STORE_CLAIMS);
+    for (const v of m.values()) {
+      if ((v as { code?: string }).code === claim.code) {
+        return { ok: false, existing: v as { code: string } & Record<string, unknown> };
+      }
+    }
+    m.set(claim.id, claim);
+    return { ok: true };
+  }
+  return new Promise((resolve) => {
+    try {
+      const t = db.transaction(STORE_CLAIMS, 'readwrite');
+      const os = t.objectStore(STORE_CLAIMS);
+      const q = os.index('code').get(claim.code);
+      q.onsuccess = () => {
+        const hit = q.result as (T | undefined);
+        if (hit) { resolve({ ok: false, existing: hit }); return; }
+        // 注意：必须在同一事务回调链内直接发起 add，不能穿插其他 await
+        const w = os.add(claim);
+        w.onsuccess = () => resolve({ ok: true });
+        w.onerror = () => {
+          // 唯一索引兜底（极端竞态）：重新读出首次核销记录返回
+          const t2 = db.transaction(STORE_CLAIMS, 'readonly');
+          const q2 = t2.objectStore(STORE_CLAIMS).index('code').get(claim.code);
+          q2.onsuccess = () => resolve({ ok: false, existing: (q2.result as T | undefined) ?? null });
+          q2.onerror = () => resolve({ ok: false, existing: null });
+        };
+      };
+      q.onerror = () => resolve({ ok: false, existing: null });
+    } catch { resolve({ ok: false, existing: null }); }
+  });
 }

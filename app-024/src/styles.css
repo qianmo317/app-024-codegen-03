@@ -180,6 +180,30 @@ textarea.input { resize: vertical; }
 .prize-list { list-style: none; padding: 0; margin: 10px 0 0; }
 .prize-list li { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 
+/* ---- 领奖核销 ---- */
+.redeem-grid { display: grid; gap: 14px; grid-template-columns: 3fr 2fr; align-items: start; }
+@media (max-width: 860px) { .redeem-grid { grid-template-columns: 1fr; } }
+.redeem-code { letter-spacing: 2px; text-transform: uppercase; }
+.redeem-code-big {
+  font-size: 30px; font-weight: 800; color: var(--red); letter-spacing: 2px;
+  min-width: 150px; text-align: center; padding: 12px 10px; align-self: flex-start;
+  border: 2px solid var(--red); border-radius: 12px; line-height: 1;
+}
+.claim-block {
+  background: #fdeeee; border: 1px solid #f2c4c4; border-radius: 8px;
+  padding: 10px 12px; margin-top: 10px;
+}
+.claim-block-title { color: var(--bad); font-weight: 700; margin: 0 0 6px; }
+.claim-block .dup-list { color: var(--ink); }
+.stock-input { width: 90px; }
+.stock-list li { gap: 10px; }
+.stock-confirm p { font-weight: 600; }
+.report-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+.report-group { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #fffdf7; }
+.report-group h4 { margin: 0 0 6px; color: var(--red); }
+.report-list { margin: 4px 0 8px; padding-left: 18px; font-size: 13.5px; }
+.report-list li { margin-bottom: 3px; }
+
 /* ---- 大屏模式 ---- */
 .bigscreen {
   position: fixed; inset: 0; z-index: 100;
