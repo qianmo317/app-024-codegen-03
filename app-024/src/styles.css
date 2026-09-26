@@ -180,6 +180,19 @@ textarea.input { resize: vertical; }
 .prize-list { list-style: none; padding: 0; margin: 10px 0 0; }
 .prize-list li { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 
+/* ---- 领奖核销 ---- */
+.redeem-grid { grid-template-columns: 3fr 2fr; }
+@media (max-width: 860px) { .redeem-grid { grid-template-columns: 1fr; } }
+.redeem-code { width: 240px; text-transform: uppercase; }
+.redeem-code-big { font-size: 34px; min-width: 150px; }
+.redeem-already .redeem-code-big { border-color: var(--bad); color: var(--bad); }
+.redeem-report { margin-top: 14px; }
+.redeem-report-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 860px) { .redeem-report-grid { grid-template-columns: 1fr; } }
+.redeem-report h4, .settings-sub { margin: 12px 0 6px; color: var(--red); }
+.settings-sub { font-size: 14px; }
+.stock-limit { max-width: 110px; }
+
 /* ---- 大屏模式 ---- */
 .bigscreen {
   position: fixed; inset: 0; z-index: 100;

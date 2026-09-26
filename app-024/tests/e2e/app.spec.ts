@@ -270,4 +270,144 @@ test.describe('元宵灯谜库 E2E', () => {
     await expect(page.locator('.stat-ok')).toContainText('3');
     await expect(page.locator('.records-table tbody tr')).toHaveCount(3);
   });
+
+  // ---- 领奖核销 ----
+
+  /** 登记谜号 1、2 并生成兑奖号码（DJ-0001 / DJ-0002） */
+  async function seedCodedRecords(page: import('@playwright/test').Page) {
+    await importSample(page);
+    await page.click('nav >> text=现场登记');
+    for (const no of ['1', '2']) {
+      await page.fill('.onsite-no', no);
+      await page.click('button:has-text("查找")');
+      await page.click('button:has-text("✓ 登记猜中")');
+    }
+    await page.click('button:has-text("生成兑奖号码")');
+    await expect(page.locator('.msg-ok')).toContainText('已生成 2 个');
+  }
+
+  test('领奖核销：核销 → 重复拦截显示首次记录 → 错号提示', async ({ page }) => {
+    await seedCodedRecords(page);
+    await page.click('nav >> text=领奖核销');
+    await page.selectOption('.redeem-window', '1 号窗');
+    await page.fill('.redeem-operator', '李四');
+    // 查号并核销
+    await page.fill('.redeem-code', 'DJ-0001');
+    await page.click('button:has-text("查找")');
+    await expect(page.locator('.onsite-current')).toContainText('一口咬掉牛尾巴');
+    await expect(page.locator('.onsite-current')).toContainText('参与奖');
+    await page.click('button:has-text("✓ 确认核销发奖")');
+    await expect(page.locator('.msg-ok')).toContainText('已核销：DJ-0001 · 参与奖 · 1 号窗 · 经手人 李四');
+    await expect(page.locator('.stat-ok')).toContainText('1');
+    // 同一号码再次来领：当场拦下并显示首次领取记录
+    await page.fill('.redeem-code', 'dj0001');
+    await page.click('button:has-text("查找")');
+    await expect(page.locator('.msg-warn')).toContainText('已核销过，请勿重复发奖');
+    await expect(page.locator('.redeem-already')).toContainText('1 号窗');
+    await expect(page.locator('.redeem-already')).toContainText('李四');
+    await expect(page.locator('.redeem-already')).toContainText('领取时间');
+    // 号码查不到 / 格式错误：明确提示
+    await page.fill('.redeem-code', 'DJ-9999');
+    await page.click('button:has-text("查找")');
+    await expect(page.locator('.msg-bad')).toContainText('DJ-9999 查不到对应登记');
+    await page.fill('.redeem-code', 'abc');
+    await page.click('button:has-text("查找")');
+    await expect(page.locator('.msg-bad')).toContainText('不是有效的兑奖号码');
+  });
+
+  test('两个窗口同时核销同一号码：只成功一次', async ({ page }) => {
+    await seedCodedRecords(page);
+    await page.click('nav >> text=领奖核销');
+    const page2 = await page.context().newPage();
+    await page2.goto('/#/redeem');
+    // 两个窗口都先查到同一号码（均显示可核销）
+    await page.fill('.redeem-code', 'DJ-0001');
+    await page.click('button:has-text("查找")');
+    await page2.fill('.redeem-code', 'DJ-0001');
+    await page2.click('button:has-text("查找")');
+    await expect(page.locator('.onsite-current')).toBeVisible();
+    await expect(page2.locator('.onsite-current')).toBeVisible();
+    // 同时点击核销：一个成功，另一个被拦下并看到首次记录
+    await Promise.all([
+      page.click('button:has-text("✓ 确认核销发奖")'),
+      page2.click('button:has-text("✓ 确认核销发奖")'),
+    ]);
+    const msgs = await Promise.all([
+      page.locator('.msg').first().textContent(),
+      page2.locator('.msg').first().textContent(),
+    ]);
+    const joined = msgs.join('\n');
+    expect(joined).toContain('已核销：DJ-0001');
+    expect(joined).toContain('已核销过，请勿重复发奖');
+    // 刷新后两窗口都只有 1 条核销记录
+    await page.reload();
+    await expect(page.locator('.stat-ok')).toContainText('1');
+    await expect(page.locator('.records-table tbody tr')).toHaveCount(1);
+    await page2.close();
+  });
+
+  test('奖品发到设定数量需确认后再发', async ({ page }) => {
+    await seedCodedRecords(page);
+    // 设置「参与奖」设定数量为 1
+    await page.click('nav >> text=设置');
+    await page.locator('.stock-limit').first().fill('1');
+    await expect(page.locator('.stock-limit').first()).toHaveValue('1');
+    await page.click('nav >> text=领奖核销');
+    // 第一份正常核销
+    await page.fill('.redeem-code', 'DJ-0001');
+    await page.click('button:has-text("查找")');
+    await page.click('button:has-text("✓ 确认核销发奖")');
+    await expect(page.locator('.msg-ok')).toContainText('已核销：DJ-0001');
+    // 第二份达到设定数量：先拦下要求确认
+    await page.fill('.redeem-code', 'DJ-0002');
+    await page.click('button:has-text("查找")');
+    await page.click('button:has-text("✓ 确认核销发奖")');
+    await expect(page.locator('.msg-warn')).toContainText('达到设定数量 1');
+    await expect(page.locator('.stat-ok')).toContainText('1'); // 未确认前不发出
+    // 确认后继续发
+    await page.click('button:has-text("确认继续发放")');
+    await expect(page.locator('.msg-ok')).toContainText('已核销：DJ-0002');
+    await expect(page.locator('.stat-ok')).toContainText('2');
+  });
+
+  test('收场统计：按奖项与窗口的已领/未领名单 + 导出 CSV', async ({ page }) => {
+    await seedCodedRecords(page);
+    await page.click('nav >> text=领奖核销');
+    await page.fill('.redeem-code', 'DJ-0001');
+    await page.click('button:has-text("查找")');
+    await page.click('button:has-text("✓ 确认核销发奖")');
+    await expect(page.locator('.msg-ok')).toContainText('已核销');
+    // 按奖项：参与奖 已领 1 未领 1；按窗口：1 号窗 1 份
+    await expect(page.locator('.report-prize-table tr', { hasText: '参与奖' })).toContainText('1');
+    await expect(page.locator('.report-window-table')).toContainText('1 号窗');
+    // 未领取名单含 DJ-0002
+    await expect(page.locator('.report-unclaimed-table')).toContainText('DJ-0002');
+    await expect(page.locator('.report-unclaimed-table tbody tr')).toHaveCount(1);
+    // 导出核销名单 CSV（BOM + 已领/未领状态列）
+    const [download] = await Promise.all([
+      page.waitForEvent('download'),
+      page.click('button:has-text("导出核销名单 CSV")'),
+    ]);
+    const buf = readFileSync((await download.path())!);
+    expect([buf[0], buf[1], buf[2]]).toEqual([0xef, 0xbb, 0xbf]);
+    const text = buf.toString('utf8');
+    expect(text).toContain('兑奖号码,谜号,谜面,猜中者,奖项,状态,领取时间,领取窗口,经手人');
+    expect(text).toContain('DJ-0001');
+    expect(text).toContain('已领取');
+    expect(text).toContain('DJ-0002');
+    expect(text).toContain('未领取');
+  });
+
+  test('核销记录持久化：刷新后重复来领仍被拦下', async ({ page }) => {
+    await seedCodedRecords(page);
+    await page.click('nav >> text=领奖核销');
+    await page.fill('.redeem-code', 'DJ-0001');
+    await page.click('button:has-text("查找")');
+    await page.click('button:has-text("✓ 确认核销发奖")');
+    await expect(page.locator('.msg-ok')).toContainText('已核销');
+    await page.reload();
+    await page.fill('.redeem-code', 'DJ-0001');
+    await page.click('button:has-text("查找")');
+    await expect(page.locator('.msg-warn')).toContainText('已核销过，请勿重复发奖');
+  });
 });

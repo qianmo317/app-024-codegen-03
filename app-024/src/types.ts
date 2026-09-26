@@ -35,6 +35,22 @@ export type OnsiteRecord = {
   code?: string;         // 兑奖号码
 };
 
+export type Redemption = {
+  id: string;
+  code: string;        // 兑奖号码（DJ-xxxx，全库唯一）
+  riddleId: string;
+  winnerName?: string;
+  prize: string;
+  window: string;      // 领取窗口
+  operator: string;    // 经手人
+  at: number;          // 领取时间
+};
+
+export type RedeemSettings = {
+  windows: string[];                   // 兑奖窗口列表
+  stockLimits: Record<string, number>; // 奖项 → 单箱设定数量（0/缺省 = 不限）
+};
+
 export type EventInfo = {
   id: string;
   title: string;
@@ -56,6 +72,7 @@ export type AppSettings = {
   event: EventInfo;
   print: PrintSetup;
   prizes: string[];
+  redeem: RedeemSettings;
 };
 
 export const CATEGORY_LABEL: Record<RiddleCategory, string> = {

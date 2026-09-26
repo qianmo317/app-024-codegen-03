@@ -7,10 +7,11 @@ import { exportFileName, store } from '../lib/store';
 
 export function Settings() {
   const state = useAppState();
-  const { event, print, prizes } = state.settings;
+  const { event, print, prizes, redeem } = state.settings;
   const [ev, setEv] = useState(event);
   const [pr, setPr] = useState(print);
   const [newPrize, setNewPrize] = useState('');
+  const [newWindow, setNewWindow] = useState('');
   const [notice, setNotice] = useState('');
 
   const saveEvent = () => void store.saveSettings({ event: { ...ev, riddleIds: event.riddleIds } }).then(() => setNotice('活动信息已保存'));
@@ -23,6 +24,18 @@ export function Settings() {
     setNewPrize('');
   };
   const delPrize = (p: string) => void store.saveSettings({ prizes: prizes.filter((x) => x !== p) });
+
+  const addWindow = () => {
+    const w = newWindow.trim();
+    if (!w || redeem.windows.includes(w)) return;
+    void store.saveSettings({ redeem: { ...redeem, windows: [...redeem.windows, w] } });
+    setNewWindow('');
+  };
+  const delWindow = (w: string) => void store.saveSettings({ redeem: { ...redeem, windows: redeem.windows.filter((x) => x !== w) } });
+  const setLimit = (prize: string, v: string) => {
+    const n = Math.max(0, Math.floor(Number(v) || 0));
+    void store.saveSettings({ redeem: { ...redeem, stockLimits: { ...redeem.stockLimits, [prize]: n } } });
+  };
 
   const exportRiddles = () => {
     const csv = stringifyCSV([RIDDLE_CSV_HEADERS, ...state.riddles.map(riddleToRow)]);
@@ -43,6 +56,11 @@ export function Settings() {
     if (!confirm(`确定清空全部 ${state.records.length} 条登记记录？此操作不可恢复。`)) return;
     await store.clearRecords();
     setNotice('现场登记已清空');
+  };
+  const clearRedemptions = async () => {
+    if (!confirm(`确定清空全部 ${state.redemptions.length} 条领奖核销记录？此操作不可恢复。`)) return;
+    await store.clearRedemptions();
+    setNotice('领奖核销记录已清空');
   };
   const clearRiddles = async () => {
     if (!confirm(`确定清空谜库全部 ${state.riddles.length} 条谜？此操作不可恢复。`)) return;
@@ -109,6 +127,33 @@ export function Settings() {
         </div>
 
         <div className="panel">
+          <h3>领奖核销</h3>
+          <h4 className="settings-sub">兑奖窗口</h4>
+          <div className="btn-row">
+            <input className="input" value={newWindow} onChange={(e) => setNewWindow(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') addWindow(); }} placeholder="新增窗口名（如 3 号窗）" />
+            <button className="btn" onClick={addWindow}>添加</button>
+          </div>
+          <ul className="prize-list">
+            {redeem.windows.map((w) => (
+              <li key={w}><span className="badge">{w}</span><button className="btn btn-ghost btn-sm" onClick={() => delWindow(w)}>移除</button></li>
+            ))}
+            {!redeem.windows.length && <li className="muted">暂无窗口（核销台将使用默认窗口）</li>}
+          </ul>
+          <h4 className="settings-sub">奖品设定数量（0 = 不限，发到数量需确认后再发）</h4>
+          {prizes.length === 0 ? <p className="muted">请先在「奖品预设」添加奖项。</p> : (
+            <div className="field-row">
+              {prizes.map((p) => (
+                <label className="field" key={p}><span>{p}</span>
+                  <input className="input stock-limit" type="number" min={0} value={redeem.stockLimits[p] ?? 0}
+                    onChange={(e) => setLimit(p, e.target.value)} />
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="panel">
           <h3>数据管理</h3>
           <div className="btn-row wrap">
             <button className="btn" onClick={() => void store.recheckAll().then(() => setNotice('已重新校验全部谜格'))}>🔄 重新校验全部谜格</button>
@@ -117,6 +162,7 @@ export function Settings() {
           </div>
           <div className="btn-row wrap">
             <button className="btn btn-danger" onClick={() => void clearRecords()}>清空现场登记（{state.records.length}）</button>
+            <button className="btn btn-danger" onClick={() => void clearRedemptions()}>清空领奖核销（{state.redemptions.length}）</button>
             <button className="btn btn-danger" onClick={() => void clearRiddles()}>清空谜库（{state.riddles.length}）</button>
           </div>
           <p className="muted small">谜库 CSV 导入在「谜库」页右上角；示例文件见 <a href={`${import.meta.env.BASE_URL}samples/riddles.csv`} download>riddles.csv</a>。全部数据保存在本机 IndexedDB，导出文件请自行留存。</p>

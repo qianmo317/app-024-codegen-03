@@ -183,6 +183,7 @@ export function Onsite() {
             <button className="btn" onClick={() => void store.generatePrizeCodes().then((n) => setMsg({ kind: 'ok', text: `已生成 ${n} 个兑奖号码（DJ-xxxx）` }))}>
               🎫 生成兑奖号码
             </button>
+            <a className="btn" href="#/redeem">前往领奖核销 →</a>
           </div>
           {state.records.length === 0 ? (
             <p className="muted">还没有登记记录。</p>

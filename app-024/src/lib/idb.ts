@@ -1,8 +1,9 @@
 // IndexedDB 轻封装（离线优先；无 IndexedDB 环境自动降级为内存存储）
 const DB_NAME = 'app-024-lantern-riddle';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 export const STORE_RIDDLES = 'riddles';
 export const STORE_RECORDS = 'records';
+export const STORE_REDEMPTIONS = 'redemptions';
 export const STORE_KV = 'kv';
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
@@ -23,6 +24,11 @@ function openDB(): Promise<IDBDatabase | null> {
         s.createIndex('riddleId', 'riddleId', { unique: false });
       }
       if (!db.objectStoreNames.contains(STORE_KV)) db.createObjectStore(STORE_KV, { keyPath: 'key' });
+      if (!db.objectStoreNames.contains(STORE_REDEMPTIONS)) {
+        const s = db.createObjectStore(STORE_REDEMPTIONS, { keyPath: 'id' });
+        // 兑奖号码唯一索引：两个窗口（标签页）同时核销同一号码时，add 只有一个能成功
+        s.createIndex('code', 'code', { unique: true });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => resolve(null);
@@ -85,6 +91,40 @@ export async function putMany<T extends { id?: string; key?: string }>(store: st
 export async function del(store: string, key: string): Promise<void> {
   const { ok } = await tx(store, 'readwrite', (s) => s.delete(key));
   if (!ok) memStore(store).delete(key);
+}
+
+/**
+ * 原子写入（add 语义）：依赖 store 上 indexName 对应的唯一索引。
+ * 同一 key 已存在时本次写入失败并返回已存在的记录——跨标签页/窗口并发也只有一方成功。
+ */
+export async function addUnique<T extends { id: string }>(
+  store: string, value: T, indexName: keyof T & string,
+): Promise<{ ok: boolean; existing: T | null }> {
+  const key = (value as Record<string, unknown>)[indexName];
+  const db = await openDB();
+  if (!db) {
+    const m = memStore(store);
+    for (const v of m.values()) {
+      if ((v as Record<string, unknown>)[indexName] === key) return { ok: false, existing: v as T };
+    }
+    m.set(value.id, value);
+    return { ok: true, existing: null };
+  }
+  return new Promise((resolve) => {
+    try {
+      const t = db.transaction(store, 'readwrite');
+      const req = t.objectStore(store).add(value);
+      req.onsuccess = () => resolve({ ok: true, existing: null });
+      req.onerror = () => {
+        // 唯一索引冲突：取出已存在的那条（第一次核销的记录）
+        try {
+          const q = db.transaction(store, 'readonly').objectStore(store).index(indexName).get(key as IDBValidKey);
+          q.onsuccess = () => resolve({ ok: false, existing: (q.result as T) ?? null });
+          q.onerror = () => resolve({ ok: false, existing: null });
+        } catch { resolve({ ok: false, existing: null }); }
+      };
+    } catch { resolve({ ok: false, existing: null }); }
+  });
 }
 
 export async function clearStore(store: string): Promise<void> {

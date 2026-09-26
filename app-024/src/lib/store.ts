@@ -1,11 +1,13 @@
 // 集中式应用状态：数据读写全部在此，UI 只做展示与动作调用
-import type { AppSettings, OnsiteRecord, Riddle } from '../types';
+import type { AppSettings, OnsiteRecord, Redemption, Riddle } from '../types';
 import { validateRiddle } from './validate';
+import { normalizeCode } from './redeem';
 import { EMPTY_CTX, loadDataCtx, type DataCtx } from './datafiles';
 import * as idb from './idb';
 import { formatDate } from './format';
 
 const KV_SETTINGS = 'settings';
+const SYNC_CHANNEL = 'app-024-sync'; // 跨标签页同步（BroadcastChannel）
 
 export const DEFAULT_SETTINGS: AppSettings = {
   event: { id: 'event-default', title: '元宵灯会', host: '', date: '', riddleIds: [] },
@@ -15,16 +17,24 @@ export const DEFAULT_SETTINGS: AppSettings = {
     hostLine: '',
   },
   prizes: ['参与奖', '三等奖', '二等奖', '一等奖'],
+  redeem: { windows: ['1 号窗', '2 号窗'], stockLimits: {} },
 };
 
 export interface AppState {
   ready: boolean;
   riddles: Riddle[];
   records: OnsiteRecord[];
+  redemptions: Redemption[];
   settings: AppSettings;
   ctx: DataCtx; // 拼音/部件离线数据
   selected: Set<string>; // 批量出条选中（会话级，不持久化）
 }
+
+export type RedeemResult =
+  | { ok: true; redemption: Redemption }
+  | { ok: false; reason: 'invalid'; input: string }
+  | { ok: false; reason: 'not-found'; code: string }
+  | { ok: false; reason: 'already'; code: string; existing?: Redemption };
 
 type Listener = () => void;
 
@@ -37,12 +47,14 @@ class AppStore {
     ready: false,
     riddles: [],
     records: [],
+    redemptions: [],
     settings: DEFAULT_SETTINGS,
     ctx: EMPTY_CTX,
     selected: new Set<string>(),
   };
   private listeners = new Set<Listener>();
   private initPromise: Promise<void> | null = null;
+  private bc: BroadcastChannel | null = null;
 
   getState = (): AppState => this.state;
 
@@ -59,25 +71,36 @@ class AppStore {
   init(): Promise<void> {
     if (!this.initPromise) {
       this.initPromise = (async () => {
-        const [riddles, records, settings, ctx] = await Promise.all([
+        const [riddles, records, redemptions, settings, ctx] = await Promise.all([
           idb.getAll<Riddle>(idb.STORE_RIDDLES),
           idb.getAll<OnsiteRecord>(idb.STORE_RECORDS),
+          idb.getAll<Redemption>(idb.STORE_REDEMPTIONS),
           idb.getKV<AppSettings>(KV_SETTINGS),
           loadDataCtx(import.meta.env.BASE_URL),
         ]);
         this.state.riddles = riddles.sort((a, b) => a.no - b.no);
         this.state.records = records.sort((a, b) => b.at - a.at);
+        this.state.redemptions = redemptions.sort((a, b) => b.at - a.at);
         if (settings) {
           this.state.settings = {
             event: { ...DEFAULT_SETTINGS.event, ...settings.event },
             print: { ...DEFAULT_SETTINGS.print, ...settings.print },
             prizes: settings.prizes?.length ? settings.prizes : DEFAULT_SETTINGS.prizes,
+            redeem: {
+              windows: settings.redeem?.windows?.length ? settings.redeem.windows : DEFAULT_SETTINGS.redeem.windows,
+              stockLimits: settings.redeem?.stockLimits ?? {},
+            },
           };
         }
         if (!this.state.settings.print.hostLine && this.state.settings.event.host) {
           this.state.settings.print.hostLine = `${this.state.settings.event.host}`;
         }
         this.state.ctx = ctx;
+        // 其他窗口（标签页）核销后，及时拉回最新核销记录，避免慢一拍重复发奖
+        if (typeof BroadcastChannel !== 'undefined') {
+          this.bc = new BroadcastChannel(SYNC_CHANNEL);
+          this.bc.onmessage = (e) => { if (e.data === 'redemptions') void this.reloadRedemptions(); };
+        }
         this.state.ready = true;
         this.emit();
       })();
@@ -211,19 +234,93 @@ class AppStore {
     this.emit();
   }
 
-  /** 兑奖号码生成：按登记时间顺序生成 DJ-xxxx（仅生成号码，不做在线抽奖） */
+  /** 兑奖号码生成：按登记时间顺序生成 DJ-xxxx（仅生成号码，不做在线抽奖）；已生成的号码不重号 */
   async generatePrizeCodes(): Promise<number> {
     let n = 0;
+    for (const r of this.state.records) {
+      const m = r.code?.match(/^DJ-(\d+)$/);
+      if (m) n = Math.max(n, parseInt(m[1], 10));
+    }
+    let made = 0;
     const sorted = [...this.state.records].sort((a, b) => a.at - b.at);
     for (const r of sorted) {
       if (!r.code) {
         n++;
+        made++;
         r.code = `DJ-${String(n).padStart(4, '0')}`;
         await idb.put(idb.STORE_RECORDS, r);
       }
     }
-    if (n) this.emit();
-    return n;
+    if (made) this.emit();
+    return made;
+  }
+
+  // ---- 领奖核销 ----
+  redemptionOf(code: string): Redemption | undefined {
+    return this.state.redemptions.find((x) => x.code === code);
+  }
+
+  /** 某奖项已核销份数（配合设定数量做发放前确认） */
+  prizeIssued(prize: string): number {
+    return this.state.redemptions.filter((x) => x.prize === prize).length;
+  }
+
+  /**
+   * 核销一个兑奖号码：同一号码全库只能核销一次。
+   * 唯一性由 redemptions 表 code 唯一索引保证（add 原子写入），
+   * 两个窗口（标签页）同时核销同一号码也只有一方成功，另一方拿到首次领取记录。
+   */
+  async redeemByCode(input: string, windowName: string, operator: string): Promise<RedeemResult> {
+    const code = normalizeCode(input);
+    if (!code) return { ok: false, reason: 'invalid', input };
+    const rec = this.state.records.find((r) => r.code === code);
+    if (!rec) return { ok: false, reason: 'not-found', code };
+    // 本标签页内存快速拦截
+    const inMem = this.redemptionOf(code);
+    if (inMem) return { ok: false, reason: 'already', code, existing: inMem };
+
+    const redemption: Redemption = {
+      id: uid(), code, riddleId: rec.riddleId,
+      winnerName: rec.winnerName, prize: rec.prize,
+      window: windowName, operator, at: Date.now(),
+    };
+    const { ok, existing } = await idb.addUnique(idb.STORE_REDEMPTIONS, redemption, 'code');
+    if (!ok) {
+      // 另一窗口已抢先核销：拉回首次领取记录并同步到本页内存
+      const prior = existing
+        ?? (await idb.getAll<Redemption>(idb.STORE_REDEMPTIONS)).find((x) => x.code === code)
+        ?? undefined;
+      if (prior && !this.redemptionOf(code)) {
+        this.state.redemptions = [prior, ...this.state.redemptions];
+        this.emit();
+      }
+      return { ok: false, reason: 'already', code, existing: prior };
+    }
+    this.state.redemptions = [redemption, ...this.state.redemptions];
+    this.bc?.postMessage('redemptions');
+    this.emit();
+    return { ok: true, redemption };
+  }
+
+  /** 撤销一次核销（误操作回退；撤销后该号码可重新核销） */
+  async revokeRedemption(id: string): Promise<void> {
+    this.state.redemptions = this.state.redemptions.filter((x) => x.id !== id);
+    await idb.del(idb.STORE_REDEMPTIONS, id);
+    this.bc?.postMessage('redemptions');
+    this.emit();
+  }
+
+  async clearRedemptions(): Promise<void> {
+    this.state.redemptions = [];
+    await idb.clearStore(idb.STORE_REDEMPTIONS);
+    this.bc?.postMessage('redemptions');
+    this.emit();
+  }
+
+  private async reloadRedemptions(): Promise<void> {
+    const list = await idb.getAll<Redemption>(idb.STORE_REDEMPTIONS);
+    this.state.redemptions = list.sort((a, b) => b.at - a.at);
+    this.emit();
   }
 
   // ---- 设置 ----
@@ -232,6 +329,9 @@ class AppStore {
       event: { ...this.state.settings.event, ...patch.event },
       print: { ...this.state.settings.print, ...patch.print },
       prizes: patch.prizes ?? this.state.settings.prizes,
+      redeem: patch.redeem
+        ? { windows: patch.redeem.windows ?? this.state.settings.redeem.windows, stockLimits: patch.redeem.stockLimits ?? this.state.settings.redeem.stockLimits }
+        : this.state.settings.redeem,
     };
     await idb.setKV(KV_SETTINGS, this.state.settings);
     this.emit();
